@@ -26,9 +26,8 @@ Unlike simple chatbots, Negotiate AI simulates dynamic negotiations by tracking 
 # 🎯 Supported Scenarios
 
 - 💼 Salary Negotiation
-- 🚗 Buying a Used Car
 - 💻 Freelance Project
-- 🏠 Rent Negotiation
+
 
 Each scenario provides its own negotiation context, objectives, and discussion topics.
 
