@@ -112,7 +112,7 @@ FastAPI Backend
 
                     ▼
 
-              Ollama (Llama 3.2)
+              Gemini API
 ```
 
 The architecture separates business logic from LLM communication, making it easy to replace the model provider in the future.
@@ -173,9 +173,9 @@ BaseLLMProvider
 
         │
 
-        ├── OllamaProvider
+        ├── GeminiProvider
+        ├── OllamaProvider (future)
         ├── OpenAIProvider (future)
-        ├── GeminiProvider (future)
         └── ClaudeProvider (future)
 ```
 
@@ -234,8 +234,7 @@ After negotiation completion, generates a personalized report including:
 
 ## AI
 
-- Ollama
-- Llama 3.2
+- Google Gemini API (`google-genai` SDK)
 
 ---
 
@@ -309,11 +308,16 @@ npm run dev
 
 ---
 
-## Start Ollama
+## Configure Gemini
+
+Create an API key in [Google AI Studio](https://aistudio.google.com/apikey), then:
 
 ```bash
-ollama run llama3.2
+cd backend
+cp .env.example .env      # set GEMINI_API_KEY inside .env
 ```
+
+The model defaults to `gemini-2.5-flash`; override it with `GEMINI_MODEL` in `.env`.
 
 ---
 

@@ -2,12 +2,22 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 from datetime import datetime
 from typing import Any, Dict, Final
 
-from ollama import Client, ResponseError
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types
+
+try:  # optional: load GEMINI_API_KEY / GEMINI_MODEL from a local .env file
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:  # pragma: no cover - python-dotenv is optional
+    pass
 
 try:
     from ..core.logging_config import setup_logging
@@ -21,8 +31,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-OLLAMA_MODEL: Final[str] = "llama3.2"
-OLLAMA_HOST: Final[str] = "http://localhost:11434"
+GEMINI_MODEL: Final[str] = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 REQUEST_TIMEOUT_SECONDS: Final[float] = 180.0
 
 # Lower temperature for structured JSON; slightly higher for natural replies.
@@ -39,11 +48,11 @@ REQUIRED_ANALYSIS_KEYS: Final[tuple[str, ...]] = (
 
 
 class LLMServiceError(Exception):
-    """Raised when the local LLM service fails to respond correctly."""
+    """Raised when the LLM service fails to respond correctly."""
 
 
 class LLMService:
-    """Single backend gateway for all LLM communication via local Ollama.
+    """Single backend gateway for all LLM communication via the Gemini API.
 
     This module handles transport to the model only. It does not build
     negotiation prompts, mutate session state, or apply negotiation logic.
@@ -51,13 +60,35 @@ class LLMService:
 
     def __init__(
         self,
-        model: str = OLLAMA_MODEL,
-        host: str = OLLAMA_HOST,
+        model: str = GEMINI_MODEL,
+        api_key: str | None = None,
         timeout: float = REQUEST_TIMEOUT_SECONDS,
     ) -> None:
         self.model = model
         self.timeout = timeout
-        self._client = Client(host=host, timeout=timeout)
+        self._api_key = api_key
+        # The client is created lazily so the backend can start (and report a
+        # clear error on the first request) even if no API key is configured.
+        self._client: genai.Client | None = None
+
+    def _get_client(self) -> genai.Client:
+        """Create the Gemini client on first use."""
+        if self._client is None:
+            api_key = (
+                self._api_key
+                or os.getenv("GEMINI_API_KEY")
+                or os.getenv("GOOGLE_API_KEY")
+            )
+            if not api_key:
+                raise LLMServiceError(
+                    "Gemini API key not found. Set the GEMINI_API_KEY "
+                    "environment variable (see .env.example)."
+                )
+            self._client = genai.Client(
+                api_key=api_key,
+                http_options=types.HttpOptions(timeout=int(self.timeout * 1000)),
+            )
+        return self._client
 
     def analyze_message(self, message: str) -> Dict[str, int]:
         """Analyze a user negotiation message and return validated metric scores.
@@ -112,8 +143,8 @@ class LLMService:
 
         Args:
             prompt: Full prompt produced by ``prompt_builder.py``.
-            response_format: Optional Ollama output format constraint.
-                Pass "json" to force Ollama's grammar-constrained JSON mode
+            response_format: Optional output format constraint.
+                Pass "json" to force Gemini's JSON response mode
                 (used by the report generator's AI evaluation, which needs
                 guaranteed-valid JSON). Leave as None for ordinary free-text
                 negotiation replies -- this is the default and preserves
@@ -143,7 +174,7 @@ class LLMService:
         request_type: str = "generate",
         response_format: str | None = None,
     ) -> str:
-        """Send a prompt to Ollama and return trimmed model output."""
+        """Send a prompt to Gemini and return trimmed model output."""
         start_wall_clock = datetime.now()
         start_perf = time.perf_counter()
 
@@ -159,13 +190,20 @@ class LLMService:
         )
 
         try:
-            response = self._client.generate(
-                model=self.model,
-                prompt=prompt,
-                options={"temperature": temperature},
-                format=response_format,
+            config = types.GenerateContentConfig(
+                temperature=temperature,
+                response_mime_type=(
+                    "application/json" if response_format == "json" else None
+                ),
             )
-        except ResponseError as exc:
+            response = self._get_client().models.generate_content(
+                model=self.model,
+                contents=prompt,
+                config=config,
+            )
+        except LLMServiceError:
+            raise
+        except genai_errors.APIError as exc:
             duration = time.perf_counter() - start_perf
             logger.error(
                 "LLM request failed | request_type=%s model=%s "
@@ -177,7 +215,7 @@ class LLMService:
                 str(exc),
                 exc_info=True,
             )
-            raise _map_response_error(exc) from exc
+            raise _map_api_error(exc, self.model) from exc
         except ConnectionError as exc:
             duration = time.perf_counter() - start_perf
             logger.error(
@@ -191,7 +229,7 @@ class LLMService:
                 exc_info=True,
             )
             raise LLMServiceError(
-                "Could not connect to Ollama. Ensure the Ollama service is running."
+                "Could not connect to the Gemini API. Check your network connection."
             ) from exc
         except Exception as exc:
             duration = time.perf_counter() - start_perf
@@ -205,7 +243,7 @@ class LLMService:
                 str(exc),
                 exc_info=True,
             )
-            raise LLMServiceError(f"Unexpected Ollama error: {exc}") from exc
+            raise LLMServiceError(f"Unexpected Gemini error: {exc}") from exc
 
         end_wall_clock = datetime.now()
         duration = time.perf_counter() - start_perf
@@ -221,7 +259,7 @@ class LLMService:
                 duration,
                 end_wall_clock.isoformat(),
             )
-            raise LLMServiceError("Ollama returned an empty response.")
+            raise LLMServiceError("Gemini returned an empty response.")
 
         logger.info(
             "LLM request finished | request_type=%s model=%s temperature=%s "
@@ -252,11 +290,11 @@ def _build_analysis_prompt(message: str) -> str:
 
 
 def _extract_response_text(response: Any) -> str:
-    """Extract generated text from an Ollama response object or dict."""
+    """Extract generated text from a Gemini response object or dict."""
     if isinstance(response, dict):
-        text = response.get("response", "")
+        text = response.get("text", "")
     else:
-        text = getattr(response, "response", "")
+        text = getattr(response, "text", "")
 
     if not isinstance(text, str):
         return ""
@@ -325,19 +363,25 @@ def _parse_and_validate_analysis(raw_output: str) -> Dict[str, int]:
     return validated
 
 
-def _map_response_error(exc: ResponseError) -> LLMServiceError:
-    """Convert Ollama API errors into clearer application exceptions."""
+def _map_api_error(exc: genai_errors.APIError, model: str) -> LLMServiceError:
+    """Convert Gemini API errors into clearer application exceptions."""
+    status = getattr(exc, "code", None)
     message = str(exc).lower()
 
-    if "model" in message and ("not found" in message or "pull" in message):
+    if status == 404 or ("model" in message and "not found" in message):
         return LLMServiceError(
-            f"Model '{OLLAMA_MODEL}' was not found in Ollama. "
-            f"Run: ollama pull {OLLAMA_MODEL}"
+            f"Gemini model '{model}' was not found. Set GEMINI_MODEL to a "
+            "model available to your API key."
         )
 
-    if "connection refused" in message or "failed to connect" in message:
+    if status in (401, 403) or "api key" in message:
         return LLMServiceError(
-            "Could not connect to Ollama. Ensure the Ollama service is running."
+            "Gemini rejected the API key. Check the GEMINI_API_KEY value."
         )
 
-    return LLMServiceError(f"Ollama request failed: {exc}")
+    if status == 429:
+        return LLMServiceError(
+            "Gemini rate limit or quota exceeded. Wait a moment and retry."
+        )
+
+    return LLMServiceError(f"Gemini request failed: {exc}")
